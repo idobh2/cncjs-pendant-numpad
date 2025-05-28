@@ -45,6 +45,16 @@ program
     .option(
         "--productid <product>",
         "Product ID of USB HID device"
+    )
+    .option(
+        "--interface <interface>",
+        "HID interface number (default: 1)",
+        "1"
+    )
+    .option(
+        "--key-mapping <file>",
+        "Path to key mapping JSON file (default: keyboard-mapping.json)",
+        "keyboard-mapping.json"
     );
 
 program.parse(process.argv);
@@ -59,15 +69,34 @@ var options = {
     accessTokenLifetime: program.accessTokenLifetime,
     vendorid: program.vendorid,
     productid: program.productid,
-    probeoffset: program.probeoffset
+    probeoffset: program.probeoffset,
+    interface: parseInt(program.interface),
+    keyMapping: program.keyMapping
 };
+
+// Load key mapping
+var keyMapping = {};
+try {
+    if (fs.existsSync(options.keyMapping)) {
+        const mappingData = JSON.parse(fs.readFileSync(options.keyMapping, 'utf8'));
+        keyMapping = mappingData.keyMapping || {};
+        console.log(`Loaded key mapping from: ${options.keyMapping}`);
+        console.log(`Available keys: ${Object.keys(keyMapping).join(', ')}`);
+    } else {
+        console.warn(`Warning: Key mapping file not found: ${options.keyMapping}`);
+        console.warn("Please create a mapping file using the map-keyboard.js script");
+    }
+} catch (error) {
+    console.error(`Error loading key mapping file: ${error.message}`);
+    process.exit(1);
+}
 
 if (options.list) {
     serialport.list().then((ports) => {
-        ports.forEach(function(port) {
+        ports.forEach(function (port) {
             console.log(port.path);
         });
-    }).catch((err) =>{
+    }).catch((err) => {
         if (err) {
             console.error(err);
             process.exit(1);
@@ -87,208 +116,222 @@ var store = {
 };
 
 var kbdevent = {
-    l_control: 0,
-    l_shift: 0,
-    l_alt: 0,
-    l_meta: 0,
-    r_control: 0,
-    r_shift: 0,
-    r_alt: 0,
-    r_meta: 0,
-    key: 0, // Normal keys
-    extra: 0, // Advanced Keys or Special Keys
-    repeating: 0, // If it is repating a movement
+    pressedKey: null, // Name of the currently pressed key
     move: 1, // Actually move size
-    default_move: 1 // Alter by F1, F2, F3
+    default_move: 1 // Alter by movement keys
 };
 
-var createServer = function(options) {
-    serverMain(options, function(err, socket) {
-        // Grbl
-        socket.on("Grbl:state", function(state) {
-            store.controller.state = state;
-        });
-        socket.on("Grbl:settings", function(settings) {
-            store.controller.settings = settings;
-        });
-
-        // Smoothie
-        socket.on("Smoothie:state", function(state) {
-            store.controller.state = state;
-        });
-        socket.on("Smoothie:settings", function(settings) {
-            store.controller.settings = settings;
-        });
-
-        // TinyG
-        socket.on("TinyG:state", function(state) {
-            store.controller.state = state;
-        });
-        socket.on("TinyG:settings", function(settings) {
-            store.controller.settings = settings;
-        });
-
-        // Sender
-        socket.on("sender:status", function(data) {
-            store.sender.status = data;
-        });
-
-        console.log("Keyboard VID:PID is ", options.vendorId, options.productId);
-        const findPath = interface =>
-            hid
-                .devices()
-                .find(
-                    item =>
-                        item.vendorId === options.vendorId &&
-                        item.productId === options.productId &&
-                        item.interface === interface
-                ).path;
-
-        console.log("Keyboard HID Address:", findPath(0));
-
-
-        var keyboard_main = new hid.HID(findPath(0));
-
-        keyboard_main.on("data", function(data) {
-            var recv = data.toJSON().data;
-            var bits = recv.shift();
-            kbdevent.l_control = (bits & 1) !== 0;
-            kbdevent.l_shift = (bits & 2) !== 0;
-            kbdevent.l_alt = (bits & 4) !== 0;
-            kbdevent.l_meta = (bits & 8) !== 0;
-            kbdevent.r_control = (bits & 16) !== 0;
-            kbdevent.r_shift = (bits & 32) !== 0;
-            kbdevent.r_alt = (bits & 64) !== 0;
-            kbdevent.r_meta = (bits & 128) !== 0;
-            recv.shift();
-            kbdevent.key = recv.shift();
-            sendToController();
-        });
-
-
-
-        function sendToController() {
-            // Calculate move size modifiers
-            kbdevent.move = kbdevent.default_move;
-
-            console.log("key: ", kbdevent.key);
-            switch (kbdevent.key) {
-                case 87: // +
-                    socket.emit(
-                        "write",
-                        options.port,
-                        "G91 Z-" + kbdevent.move + ";\n"
+function detectPressedKey(receivedData) {
+    // Skip first byte (always 9), check bytes 1+ for non-zero values
+    for (let i = 1; i < receivedData.length; i++) {
+        if (receivedData[i] !== 0) {
+            // Found a non-zero byte, check against key mappings
+            for (const [keyName, mapping] of Object.entries(keyMapping)) {
+                if (mapping.nonZeroBytes) {
+                    // Check if this key's pattern matches
+                    const matches = mapping.nonZeroBytes.some(expectedByte =>
+                        expectedByte.position === i && expectedByte.value === receivedData[i]
                     );
-                    break;
-                case 86: // -
-                    socket.emit(
-                        "write",
-                        options.port,
-                        "G91 Z" + kbdevent.move + ";\n"
-                    );
-                    break;
-                case 92: // arrow: left
-                    socket.emit(
-                        "write",
-                        options.port,
-                        "G91 X-" + kbdevent.move + ";\n"
-                    );
-                    break;
-                case 94: // arrow: right
-                    socket.emit(
-                        "write",
-                        options.port,
-                        "G91 X" + kbdevent.move + ";\n"
-                    );
-                    break;
-                case 96: // arrow: up
-                    socket.emit(
-                        "write",
-                        options.port,
-                        "G91 Y" + kbdevent.move + ";\n"
-                    );
-                    break;
-                case 90: // arrow: down
-                    socket.emit(
-                        "write",
-                        options.port,
-                        "G91 Y-" + kbdevent.move + ";\n"
-                    );
-                    break;
+                    if (matches) {
+                        return keyName;
+                    }
+                }
+            }
+        }
+    }
+    return null; // No key detected or key released
+}
 
-                case 89: // arrow: End
-                    socket.emit(
-                        "write",
-                        options.port,
-                        "G91 X-" + kbdevent.move + " Y-" + kbdevent.move + ";\n"
-                    );
-                    break;
-
-                case 97: // arrow: Page up
-                    socket.emit(
-                        "write",
-                        options.port,
-                        "G91 X" + kbdevent.move + " Y" + kbdevent.move + ";\n"
-                    );
-                    break;
-
-                case 91: // arrow: Page Down
-                    socket.emit(
-                        "write",
-                        options.port,
-                        "G91 X" + kbdevent.move + " Y-" + kbdevent.move + ";\n"
-                    );
-                    break;
-
-                case 95: // arrow: Page Down
-                    socket.emit(
-                        "write",
-                        options.port,
-                        "G91 X-" + kbdevent.move + " Y" + kbdevent.move + ";\n"
-                    );
-                    break;
-
-                case 93: // Key: 5
-                    //socket.emit("write", options.port, "G90;\n");
-                    socket.emit("write", options.port, "G90 X0 Y0;\n");
-                    break;
-
-                case 99: // .
-                    socket.emit("write", options.port, "G91;\n");
-                    socket.emit("write", options.port, "G38.2 Z-10 F87\n");
-                    socket.emit("write", options.port, "G10 L20 P1 Z"+options.probeOffset+"\n");
-                    socket.emit("write", options.port, "G91;\n");
-                    socket.emit("write", options.port, "G0 Z4;\n");
-                    socket.emit("write", options.port, "G90;\n");
-                break;
-
-                case 83:
-                    socket.emit("write", options.port, "G10 L20 P1 X0 Y0;\n");
-                break;
-
-
-                case 98:
-                    socket.emit("write", options.port, "$X;\n");
-                    break;
-
-                case 84: // key: /
-                    kbdevent.default_move = 0.1;
-                    break;
-                case 85: // key: *
-                    kbdevent.default_move = 1;
-                    break;
-                case 42: // key: Backspace
-                    kbdevent.default_move = 10;
-                    break;
-
-                case 88: // Key: OK or Enter
-                    socket.emit("write", options.port, "$H;\n");
-                default:
-                    break;
+var createServer = async function (options) {
+    return new Promise((resolve, reject) => {
+        serverMain(options, async function (err, socket) {
+            if (err) {
+                reject(err);
+                return;
             }
 
-	    //console.log(kbdevent);
-        }
+            // Grbl
+            socket.on("Grbl:state", function (state) {
+                store.controller.state = state;
+            });
+            socket.on("Grbl:settings", function (settings) {
+                store.controller.settings = settings;
+            });
+
+            // Smoothie
+            socket.on("Smoothie:state", function (state) {
+                store.controller.state = state;
+            });
+            socket.on("Smoothie:settings", function (settings) {
+                store.controller.settings = settings;
+            });
+
+            // TinyG
+            socket.on("TinyG:state", function (state) {
+                store.controller.state = state;
+            });
+            socket.on("TinyG:settings", function (settings) {
+                store.controller.settings = settings;
+            });
+
+            // Sender
+            socket.on("sender:status", function (data) {
+                store.sender.status = data;
+            });
+
+            console.log("Keyboard VID:PID is ", options.vendorId, options.productId);
+            try {
+                // Use async API to get devices
+                const devices = await hid.devicesAsync();
+                console.log("devices:\n", devices.map(item => JSON.stringify(item)).join("\n"));
+                const findPath = interface =>
+                    devices.find(
+                        item =>
+                            item.vendorId === options.vendorId &&
+                            item.productId === options.productId &&
+                            item.interface === interface
+                    )?.path;
+
+                console.log("Keyboard HID Address:", findPath(options.interface));
+
+                // Use async API to open device
+                const devicePath = findPath(options.interface);
+                if (!devicePath) {
+                    throw new Error(`HID device not found with VID:${options.vendorId} PID:${options.productId} Interface:${options.interface}`);
+                }
+
+                var keyboard_main = await hid.HIDAsync.open(devicePath);
+
+                keyboard_main.on("data", function (data) {
+                    var recv = data.toJSON().data;
+                    console.log("recv: ", recv);
+
+                    const detectedKey = detectPressedKey(recv);
+
+                    if (detectedKey && detectedKey !== kbdevent.pressedKey) {
+                        // New key pressed
+                        kbdevent.pressedKey = detectedKey;
+                        console.log("Key pressed:", detectedKey);
+                        sendToController();
+                    } else if (!detectedKey && kbdevent.pressedKey) {
+                        // Key released
+                        console.log("Key released:", kbdevent.pressedKey);
+                        kbdevent.pressedKey = null;
+                        // Note: We don't call sendToController on key release
+                    }
+                });
+
+                keyboard_main.on("error", function (err) {
+                    console.error("HID device error:", err);
+                });
+
+                resolve(socket);
+            } catch (error) {
+                console.error("Error setting up HID device:", error);
+                reject(error);
+            }
+
+            function sendToController() {
+                // Calculate move size modifiers
+                kbdevent.move = kbdevent.default_move;
+
+                console.log("Pressed key:", kbdevent.pressedKey);
+                switch (kbdevent.pressedKey) {
+                    case "8":
+                    case "Up":
+                        socket.emit(
+                            "write",
+                            options.port,
+                            "G91 Y" + kbdevent.move + ";\n"
+                        );
+                        break;
+                    case "2":
+                    case "Down": // Y-
+                        socket.emit(
+                            "write",
+                            options.port,
+                            "G91 Y-" + kbdevent.move + ";\n"
+                        );
+                        break;
+                    case "4":
+                    case "Left": // X-
+                        socket.emit(
+                            "write",
+                            options.port,
+                            "G91 X-" + kbdevent.move + ";\n"
+                        );
+                        break;
+                    case "6":
+                    case "Right": // X+
+                        socket.emit(
+                            "write",
+                            options.port,
+                            "G91 X" + kbdevent.move + ";\n"
+                        );
+                        break;
+
+                    case "Plus": // Z+
+                        socket.emit(
+                            "write",
+                            options.port,
+                            "G91 Z" + kbdevent.move + ";\n"
+                        );
+                        break;
+
+                    case "Enter": // Z-
+                        socket.emit(
+                            "write",
+                            options.port,
+                            "G91 Z-" + kbdevent.move + ";\n"
+                        );
+                        break;
+
+                    case "PageUp":
+                        socket.emit("write", options.port, "G10 L20 P1 Z0;\n");
+                        break;
+
+                    case "PageDown":
+                        // Probe Z
+                        break;
+
+                    case "Home":
+                        socket.emit("write", options.port, "G10 L20 P1 X0;\n");
+                        break;
+
+
+                    case "End":
+                        // Probe X
+                        break;
+
+                    case "Tab":
+                        socket.emit("write", options.port, "G10 L20 P1 Y0;\n");
+                        break;
+
+
+                    case "Delete":
+                        // Probe Y
+                        break;
+
+                    case "Backspace": // Unlock/reset
+                        socket.emit("write", options.port, "$X\n");
+                        break;
+
+                    case "Slash": // Small movement (0.1)
+                        kbdevent.default_move = 0.1;
+                        break;
+                    case "Asterisk": // Medium movement (1)
+                        kbdevent.default_move = 1;
+                        break;
+                    case "Minus": // Large movement (10)
+                        kbdevent.default_move = 10;
+                        break;
+
+                    default:
+                        console.log("Unmapped key:", kbdevent.pressedKey);
+                        break;
+                }
+            }
+        });
     });
 };
 
@@ -296,12 +339,15 @@ var createServer = function(options) {
 // console.log('devices:', hid.devices());
 
 if (options.port) {
-    createServer(options);
+    createServer(options).catch((err) => {
+        console.error("Error creating server:", err);
+        process.exit(1);
+    });
     return;
 }
 
 serialport.list().then((ports) => {
-    const choices = ports.map(function(port) {
+    const choices = ports.map(function (port) {
         return port.path;
     });
 
@@ -314,12 +360,15 @@ serialport.list().then((ports) => {
                 choices: choices
             }
         ])
-        .then(function(answers) {
+        .then(function (answers) {
             options.port = answers.port;
 
-            createServer(options);
+            createServer(options).catch((err) => {
+                console.error("Error creating server:", err);
+                process.exit(1);
+            });
         });
-}).catch((err) =>{
+}).catch((err) => {
     if (err) {
         console.error(err);
         process.exit(1);

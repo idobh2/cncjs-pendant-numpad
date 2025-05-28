@@ -1,0 +1,233 @@
+#!/usr/bin/env node
+
+var fs = require("fs");
+var path = require("path");
+var program = require("commander");
+var pkg = require("../package.json");
+var hid = require("node-hid");
+
+program
+	.version(pkg.version)
+	.usage("--vendorid <vendor> --productid <product> [options]")
+	.option(
+		"--vendorid <vendor>",
+		"Vendor ID of USB HID device (required)"
+	)
+	.option(
+		"--productid <product>",
+		"Product ID of USB HID device (required)"
+	)
+	.option(
+		"--interface <interface>",
+		"HID interface number (default: 1)",
+		"1"
+	)
+	.option(
+		"--output <file>",
+		"Output JSON file for key mapping (default: keyboard-mapping.json)",
+		"keyboard-mapping.json"
+	);
+
+program.parse(process.argv);
+
+if (!program.vendorid || !program.productid) {
+	console.error("Error: Both --vendorid and --productid are required");
+	program.help();
+	process.exit(1);
+}
+
+const options = {
+	vendorId: parseInt(program.vendorid, 10),
+	productId: parseInt(program.productid, 10),
+	interface: parseInt(program.interface),
+	outputFile: program.output
+};
+
+// List of keys to map - currently empty, to be filled later
+const keysToMap = [
+	"Up", "Down", "Left", "Right",
+	"PageUp", "PageDown", "Home", "End", "Tab", "Delete",
+	"Esc", "Equal", "F13", "F14", "F15",
+	"Minus", "Plus", "Asterisk", "Slash", "Backspace", "Enter",
+	"NumLock", "Period",
+	"0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+
+];
+
+let keyMapping = {};
+let currentKeyIndex = 0;
+let keyboard_main = null;
+let isWaitingForKeyPress = false;
+
+async function setupHIDDevice() {
+	try {
+		console.log("Looking for HID device with VID:", options.vendorId.toString(16), "PID:", options.productId.toString(16), "Interface:", options.interface);
+
+		// Use async API to get devices
+		const devices = await hid.devicesAsync();
+		console.log("Available devices:");
+		devices.forEach(device => {
+			if (device.vendorId === options.vendorId && device.productId === options.productId) {
+				console.log("  Found target device:", JSON.stringify(device));
+			}
+		});
+
+		const findPath = interface =>
+			devices.find(
+				item =>
+					item.vendorId === options.vendorId &&
+					item.productId === options.productId &&
+					item.interface === interface
+			)?.path;
+
+		const devicePath = findPath(options.interface);
+		if (!devicePath) {
+			throw new Error(`HID device not found with VID:${options.vendorId.toString(16)} PID:${options.productId.toString(16)} Interface:${options.interface}`);
+		}
+
+		console.log("Opening HID device at:", devicePath);
+		keyboard_main = await hid.HIDAsync.open(devicePath);
+
+		keyboard_main.on("data", function (data) {
+			const recv = data.toJSON().data;
+			console.log("Received data:", recv);
+
+			if (isWaitingForKeyPress) {
+				handleKeyPress(recv);
+			}
+		});
+
+		keyboard_main.on("error", function (err) {
+			console.error("HID device error:", err);
+		});
+
+		console.log("✓ HID device connected successfully!");
+		console.log("Starting key mapping process...\n");
+		setTimeout(promptNextKey, 1000);
+
+		return true;
+	} catch (error) {
+		console.error("Error setting up HID device:", error);
+		return false;
+	}
+}
+
+function findNonZeroBytes(data) {
+	const nonZeroBytes = [];
+
+	// Skip first byte (always 9), check bytes 1 onwards for non-zero values
+	for (let i = 1; i < data.length; i++) {
+		if (data[i] !== 0) {
+			nonZeroBytes.push({
+				position: i,
+				value: data[i]
+			});
+		}
+	}
+
+	return nonZeroBytes;
+}
+
+function handleKeyPress(receivedData) {
+	const nonZeroBytes = findNonZeroBytes(receivedData);
+
+	if (nonZeroBytes.length > 0) {
+		// Key is pressed (non-zero values detected)
+		const currentKey = keysToMap[currentKeyIndex];
+		console.log(`\nKey "${currentKey}" pressed - detected non-zero bytes:`);
+		nonZeroBytes.forEach(byte => {
+			console.log(`  Position ${byte.position}: ${byte.value}`);
+		});
+
+		// Record the mapping
+		keyMapping[currentKey] = {
+			nonZeroBytes: nonZeroBytes,
+			timestamp: new Date().toISOString()
+		};
+
+		isWaitingForKeyPress = false;
+
+		// Move to next key after a short delay to allow for key release
+		console.log(`Key "${currentKey}" mapped successfully. Moving to next key...`);
+		currentKeyIndex++;
+		setTimeout(promptNextKey, 1000); // Wait 2 seconds for key release and user to get ready
+	}
+	// If no non-zero bytes, this is a key release - ignore it
+}
+
+async function promptNextKey() {
+	if (currentKeyIndex >= keysToMap.length) {
+		console.log("\n=== All keys mapped! ===");
+		await saveMapping();
+		process.exit(0);
+		return;
+	}
+
+	const currentKey = keysToMap[currentKeyIndex];
+
+	console.log(`\n--- Ready for key "${currentKey}" ---`);
+	console.log(`Please press the "${currentKey}" key now...`);
+	console.log("(The script will automatically detect the key press)");
+
+	isWaitingForKeyPress = true;
+
+	// No timeout - wait indefinitely for key press
+}
+
+async function saveMapping() {
+	try {
+		const mappingData = {
+			deviceInfo: {
+				vendorId: options.vendorId,
+				productId: options.productId,
+				interface: options.interface,
+				vendorIdHex: options.vendorId.toString(16),
+				productIdHex: options.productId.toString(16)
+			},
+			keyMapping: keyMapping,
+			generatedAt: new Date().toISOString()
+		};
+
+		const jsonContent = JSON.stringify(mappingData, null, 2);
+		fs.writeFileSync(options.outputFile, jsonContent);
+
+		console.log(`\nKey mapping saved to: ${options.outputFile}`);
+		console.log(`Total keys mapped: ${Object.keys(keyMapping).length}`);
+		console.log(`Successful mappings: ${Object.keys(keyMapping).filter(key => !keyMapping[key].error).length}`);
+	} catch (error) {
+		console.error("Error saving mapping:", error);
+	}
+}
+
+async function main() {
+	console.log("=== Keyboard Layout Mapping Tool ===");
+	console.log(`Target device: VID:${options.vendorId.toString(16)} PID:${options.productId.toString(16)}`);
+	console.log(`Output file: ${options.outputFile}`);
+
+	if (keysToMap.length === 0) {
+		console.log("\nNote: The keys to map list is currently empty.");
+		console.log("Edit the 'keysToMap' array in this script to add the keys you want to map.");
+		console.log("Example keys: '0', '1', '2', '+', '-', 'Enter', 'Up', 'Down', etc.");
+		process.exit(0);
+	}
+
+	const setupSuccess = await setupHIDDevice();
+	if (!setupSuccess) {
+		process.exit(1);
+	}
+
+	// Handle graceful shutdown
+	process.on('SIGINT', async () => {
+		console.log('\n\nReceived SIGINT. Saving current progress...');
+		await saveMapping();
+		if (keyboard_main) {
+			keyboard_main.close();
+		}
+		process.exit(0);
+	});
+}
+
+main().catch(error => {
+	console.error("Error in main:", error);
+	process.exit(1);
+}); 
